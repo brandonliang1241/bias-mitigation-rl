@@ -34,10 +34,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL,
-        device_map="auto",
         torch_dtype=torch_dtype,
         trust_remote_code=True
-    )
+    ).to(device)
 
     os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
 

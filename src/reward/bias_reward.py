@@ -2,16 +2,26 @@ import re
 from transformers import pipeline
 
 # --- Regex-based lightweight rules ---
-TOXIC_MARKERS = [
-    r"\b(stupid|inferior|superior|criminals|lazy|violent|better|worse|smarter|weaker|stronger|naturally|tend to)\b"
-]
-
 GROUP_PATTERNS = [
     r"\b(asians|blacks|black people|whites|white people|women|men|muslims|jews|christians|immigrants)\b",
 ]
 
+# Expanded TOXIC_MARKERS
+TOXIC_MARKERS = [
+    r"\b(stupid|idiotic|inferior|superior)\b",
+    r"\b(criminals|thugs|scum|parasites|vermin)\b",
+    r"\b(lazy|unintelligent|smarter|weaker)\b",
+    r"\b(violent|aggressive|brutal)\b",
+    r"\b(better|worse)\b",
+    r"\b(naturally|tend to|prone to|inherently)\b"
+]
+
+# Expanded GENERALIZATION_WORDS
 GENERALIZATION_WORDS = [
-    r"\b(all|most|always|never|tend to|are|generally|usually)\b"
+    r"\b(all|every|everyone)\b",
+    r"\b(most|majority|many)\b",
+    r"\b(always|never|constantly|invariably)\b",
+    r"\b(generally|usually|typically|on average)\b"
 ]
 
 STYLE_KEYWORDS = [
@@ -23,7 +33,7 @@ STYLE_KEYWORDS = [
 # --- Optional pretrained classifier ---
 # Note: For this example, we will assume tox_pipeline is available or fast_mode is True.
 try:
-    tox_pipeline = pipeline("text-classification", model="unitary/toxic-bert", device=-1)
+    tox_pipeline = pipeline("text-classification", model="unitary/toxic-bert", device=0)
 except ImportError:
     print("Warning: transformers or toxic-bert model not found. Using fast_mode=True.")
     tox_pipeline = None
@@ -49,34 +59,27 @@ def group_generalization_score(text: str) -> float:
 def style_bonus(text: str) -> float:
     """Calculates a bonus for using nuanced and balanced language."""
     matches = sum(len(re.findall(pat, text.lower())) for pat in STYLE_KEYWORDS)
-    return min(matches * 0.05, 0.1)
+    return min(matches * 0.08, 0.2) # Adjusted to be more lenient and higher
 
 def length_bonus(response: str, min_len: int = 20, max_len: int = 80) -> float:
-    """
-    Rewards responses within an ideal length range, penalizing those that are too short or too long.
-    This adds a lot of variance to the reward signal.
-    """
     length = len(response.split())
     if min_len <= length <= max_len:
-        return 0.1  # Small bonus for being in the ideal range
-    else:
-        # Penalize responses based on how far they are from the range
-        if length < min_len:
-            diff = min_len - length
-        else:
-            diff = length - max_len
-        # The penalty scales with the difference
-        return -min(diff * 0.01, 0.1)
+        return 0.1  # A fixed, small bonus
+    return 0.0 # Return 0 for responses outside the range
 
-def classifier_toxicity(text: str) -> float:
-    """Uses a pretrained model to score toxicity."""
+def classifier_toxicity(text_list: list, tox_pipeline) -> list:
+    """Uses a pretrained model to score toxicity for a batch of texts."""
     if tox_pipeline is None:
-        return 0.0
-    preds = tox_pipeline(text, truncation=True)[0]
-    if preds["label"].lower() == "toxic":
-        return preds["score"]
-    else:
-        return 0.0
+        return [0.0] * len(text_list)
+    
+    preds = tox_pipeline(text_list)
+    scores = []
+    for pred in preds:
+        if pred["label"].lower() == "toxic":
+            scores.append(pred["score"])
+        else:
+            scores.append(0.0)
+    return scores
 
 def trivial_penalty(prompt: str, response: str) -> float:
     """Calculates a penalty for trivial or repeated responses."""
@@ -87,33 +90,45 @@ def trivial_penalty(prompt: str, response: str) -> float:
         penalty += 0.4
     return penalty
 
-# --- Main reward function ---
-def compute_bias_reward(prompt: str, response: str, fast_mode=True) -> float:
+# --- Normalized, variance-maximized reward ---
+def compute_bias_reward(prompt: str, response: str, fast_mode=True, tox_model_score: float = 0.0) -> float:
     """
-    Returns [0,1] reward with higher variance for RL.
-    fast_mode=True disables transformer toxicity for speed.
+    Returns [0,1] reward for RL, normalized and variance-maximized.
+    - fast_mode=True disables heavy transformer toxicity, but keeps light signal.
     """
-    tox_regex = toxicity_score_regex(response)
-    gen = group_generalization_score(response)
-    trivial = trivial_penalty(prompt, response)
-    style = style_bonus(response)
-    length = length_bonus(response)
+    # --- Base components (all normalized to [0,1]) ---
+    tox_regex = min(max(toxicity_score_regex(response), 0.0), 1.0)
+    gen = min(max(group_generalization_score(response), 0.0), 1.0)
+    trivial = min(max(trivial_penalty(prompt, response), 0.0), 1.0)
+    style = min(max(style_bonus(response), 0.0), 1.0)
+    length = min(max(length_bonus(response), 0.0), 1.0)
 
     if fast_mode:
-        tox_model = 0.0
+        tox_model = tox_regex * 0.5  # light toxicity signal
     else:
-        tox_model = classifier_toxicity(response)
+        tox_model = min(max(tox_model_score, 0.0), 1.0)
 
-    # --- Combine with non-linear penalties, leave max < 1.0 ---
+    # --- Amplify stronger violations ---
+    tox_score = tox_model ** 1.5      # amplify high toxicity
+    gen_score = gen ** 1.3            # amplify biased generation
+    trivial_score = trivial            # linear
+    style_score = style ** 0.8         # slightly compress high style
+    length_score = length ** 0.8      # slightly compress long responses
+
+    # --- Weighted sum ---
+    # Add a small, non-zero baseline reward to prevent zero advantages
+    baseline_reward = 0.2  # Increased baseline reward to provide a stronger signal
+    
     reward = (
-        0.4 * (1 - tox_model)
-        + 0.25 * (1 - tox_regex)
-        + 0.25 * (1 - gen)
-        + style
-        + length # Add the new length bonus
-        - 0.3 * trivial
+        baseline_reward
+        + 0.2 * (1 - tox_score)      # Lowered weight for the toxicity term
+        + 0.1 * (1 - gen_score)    # Lowered weight for the generalization term
+        + 0.3 * style_score         # Increased style bonus weight
+        + 0.2 * length_score       # Increased length bonus weight
+        - 0.1 * trivial_score      # Lowered trivial penalty
     )
 
-    # clamp to [0,1]
-    reward = max(0.0, min(0.95, reward))  # max < 1.0 to avoid saturation
+    # clamp to [0, 0.95] to avoid saturation
+    reward = max(0.0, min(0.95, reward))
     return reward
+

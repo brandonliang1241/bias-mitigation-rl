@@ -1,20 +1,32 @@
 import os, sys, random, json
 import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup, LogitsProcessor
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup, LogitsProcessor, pipeline
+from torch import amp
+
+torch.cuda.empty_cache()
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from reward.bias_reward import compute_bias_reward, toxicity_score_regex, group_generalization_score, style_bonus, trivial_penalty
+from reward.bias_reward import compute_bias_reward, toxicity_score_regex, group_generalization_score, style_bonus, trivial_penalty, classifier_toxicity
+
+from transformers import BitsAndBytesConfig, AutoModelForCausalLM
+# Define the quantization configuration
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
 
 MODEL = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B-Instruct")
 PROMPTS = "data/prompts/pilot_prompts.jsonl"
-OUTDIR  = "results/grpo_pilot"
+OUTDIR = "results/grpo_pilot"
 
-TOTAL_STEPS = 500
-PRINT_INTERVAL = 5
-SAVE_INTERVAL = 25  # Save a checkpoint every 50 steps
-K = 8
-FAST_MODE = False  # skip LM toxicity for speed
+TOTAL_STEPS = 1000
+PRINT_INTERVAL = 1
+SAVE_INTERVAL = 100 # Save a checkpoint every 50 steps
+K = 4
+MAX_NEW_TOKENS = 120
+FAST_MODE = False # skip LM toxicity for speed
 
 
 # --- LogitsProcessor to clamp extreme logits ---
@@ -43,22 +55,22 @@ def load_prompts(path, n=300):
 # --- build chat prompt ---
 def build_chat(tokenizer, user):
     return tokenizer.apply_chat_template([{"role": "user", "content": user}],
-                                         tokenize=False, add_generation_prompt=True)
+                                        tokenize=False, add_generation_prompt=True)
 
 
 # --- sample multiple responses safely ---
-def sample_responses(model, tok, prompt, K=4, max_new_tokens=120, temperature=0.8, top_p=0.9):
+def sample_responses_batched(model, tok, prompts, K, max_new_tokens=MAX_NEW_TOKENS, temperature=0.8, top_p=0.9):
     """
-    Sample K responses for a prompt, safely handling numerical issues.
-    Runs generation in FP32 even if model is FP16.
+    Sample K responses for a batch of prompts.
     """
-    text = tok.apply_chat_template([{"role": "user", "content": prompt}],
-                                   tokenize=False, add_generation_prompt=True)
-    inputs = tok(text, return_tensors="pt").to(model.device)
+    # 1. Prepare batched inputs
+    batched_texts = [build_chat(tok, p) for p in prompts]
+    inputs = tok(batched_texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+    
+    # 2. Generate responses in a single call
+    logits_processor = SafeClampLogitsProcessor()
 
-    # Run generation in FP32 for numerical stability
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
-        processor = [SafeClampLogitsProcessor(min_val=-50.0, max_val=50.0)]
+    with torch.no_grad():
         outs = model.generate(
             **inputs,
             do_sample=True,
@@ -66,23 +78,36 @@ def sample_responses(model, tok, prompt, K=4, max_new_tokens=120, temperature=0.
             top_p=top_p,
             num_return_sequences=K,
             max_new_tokens=max_new_tokens,
-            logits_processor=processor
+            # Add the processor here
+            logits_processor=[logits_processor] 
         )
+    
+    # 3. Decode the batched outputs
+    # The output tensor has shape (batch_size * K, sequence_length)
+    responses_list = tok.batch_decode(outs, skip_special_tokens=True)
+    
+    # 4. Restructure responses to match the original prompts
+    responses_by_prompt = []
+    for i in range(len(prompts)):
+        start_idx = i * K
+        end_idx = start_idx + K
+        prompt_responses = [
+            r.split(prompts[i])[-1].strip() for r in responses_list[start_idx:end_idx]
+        ]
+        responses_by_prompt.append({"prompt": prompts[i], "responses": prompt_responses})
 
-    responses = [
-        tok.decode(o, skip_special_tokens=True).split(prompt)[-1].strip()
-        for o in outs
-    ]
-    return responses
+    return responses_by_prompt
 
 
 # --- compute reward components ---
-def reward_components(prompt, response, fast_mode=True):
+def reward_components(prompt, response, tox_model_score, fast_mode=True):
     tox_regex = toxicity_score_regex(response)
     gen = group_generalization_score(response)
     trivial = trivial_penalty(prompt, response)
     style = style_bonus(response)
-    reward = compute_bias_reward(prompt, response, fast_mode=fast_mode)
+    
+    print(f"DEBUG | tox_regex: {tox_regex}, gen: {gen}, style: {style}, trivial: {trivial}")
+    reward = compute_bias_reward(prompt, response, fast_mode=fast_mode, tox_model_score=tox_model_score)
     return reward, tox_regex, gen, style, trivial
 
 
@@ -90,82 +115,142 @@ def reward_components(prompt, response, fast_mode=True):
 def main():
     os.makedirs(OUTDIR, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
-    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL, device_map="auto", trust_remote_code=True
-    )
+    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True, padding_side="left")
+    model = AutoModelForCausalLM.from_pretrained(MODEL, trust_remote_code=True, quantization_config=bnb_config).to(device)
+    # # --- The Corrected Fix ---
+    # # 1. Set the padding side for the tokenizer.
+    # # For decoder-only models like Qwen2, left-padding is essential for correct batch generation.
+    # tok.padding_side = "left"
+    
+    # # 2. Add a new pad token if the tokenizer doesn't have one.
+    # # Many instruction-tuned models don't have a default pad token.
+    # if tok.pad_token is None:
+    #     tok.add_special_tokens({'pad_token': '<|pad|>'})
+
+    # # 3. Resize the model's token embeddings to accommodate the new token.
+    # model.resize_token_embeddings(len(tok))
+
+    # # 4. CRITICAL: Update the model's configuration to use the new pad token ID.
+    # # This is the step that resolves the CUDA error.
+    # model.config.pad_token_id = tok.pad_token_id
+    
+    print("Initializing toxicity classifier...")
+    tox_pipeline = pipeline("text-classification", model="unitary/toxic-bert", device=-1, truncation=True)
+    print("Initialization complete.")
+
     model.train()
 
     prompts = load_prompts(PROMPTS, n=300)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-7)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6, betas=(0.9, 0.999), eps=1e-6)
     scheduler = get_linear_schedule_with_warmup(optimizer, 50, TOTAL_STEPS)
 
     step = 0
+    batch_size = 1  # Increase batch size to fully leverage the GPU
 
     while step < TOTAL_STEPS:
-        for ex in prompts:
-            prompt = ex["prompt"]
+        print(f"Step {step}:")
+        batch_prompts_data = random.sample(prompts, batch_size)
+        batch_prompts = [ex["prompt"] for ex in batch_prompts_data]
+        
+        allocated_before = torch.cuda.memory_allocated()
+        print(f"Memory allocated before empty_cache(): {allocated_before / (1024**2):.2f} MB")
+        torch.cuda.empty_cache()
+        allocated_after = torch.cuda.memory_allocated()
+        print(f"Memory allocated after empty_cache(): {allocated_after / (1024**2):.2f} MB")
 
-            # --- 1. sample responses ---
-            responses = sample_responses(model, tok, prompt, K=K)
+        # --- 1. Batch generate responses for the entire batch ---
+        all_responses_data = sample_responses_batched(model, tok, batch_prompts, K, MAX_NEW_TOKENS)
+        
+        # --- 2. Flatten all prompts and responses to prepare for reward calculation ---
+        flat_prompts = []
+        flat_responses = []
+        for ex_data in all_responses_data:
+            flat_prompts.extend([ex_data["prompt"]] * len(ex_data["responses"]))
+            flat_responses.extend(ex_data["responses"])
+            
+        # --- 3. Batch compute rewards ---
+        tox_model_scores = classifier_toxicity(flat_responses, tox_pipeline=tox_pipeline)
+        
+        # You can't easily batch the other reward functions unless you modify them
+        # to accept lists. For now, we'll keep this loop but acknowledge it's a bottleneck.
+        # ✅ Pass the pipeline as an argument
+        
+        all_rewards = []
+        all_tox, all_gen, all_style, all_trivial = [], [], [], []
+        
+        for i, r in enumerate(flat_responses):
+            reward, tox, gen, style, trivial = reward_components(flat_prompts[i], r, tox_model_scores[i], fast_mode=FAST_MODE)
+            all_rewards.append(reward)
+            all_tox.append(tox)
+            all_gen.append(gen)
+            all_style.append(style)
+            all_trivial.append(trivial)
+            
+        # --- 4. Compute advantages and create a single batched loss input ---
+        reshaped_rewards = np.array(all_rewards).reshape(batch_size, K)
+        baselines = np.median(reshaped_rewards, axis=1, keepdims=True)
+        advantages = (reshaped_rewards - baselines).flatten()
+        
+        # --- 5. Batch the REINFORCE loss calculation and optimizer step ---
+        all_full_texts = [
+            tok.apply_chat_template([
+                {"role": "user", "content": flat_prompts[i]},
+                {"role": "assistant", "content": flat_responses[i]}
+            ], tokenize=False)
+            for i in range(len(flat_prompts))
+        ]
+        
+        enc = tok(all_full_texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+        input_ids = enc.input_ids
+        
+        labels = input_ids.clone()
+        user_lens_per_seq = [len(tok(build_chat(tok, flat_prompts[i]))["input_ids"]) for i in range(len(flat_prompts))]
+        
+        for i in range(input_ids.size(0)):
+            labels[i, :user_lens_per_seq[i]] = -100
 
-            # --- 2. compute rewards ---
-            rewards, tox_list, gen_list, style_list, trivial_list = [], [], [], [], []
-            for r in responses:
-                reward, tox, gen, style, trivial = reward_components(prompt, r, fast_mode=FAST_MODE)
-                rewards.append(reward)
-                tox_list.append(tox)
-                gen_list.append(gen)
-                style_list.append(style)
-                trivial_list.append(trivial)
+        with amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            out = model(input_ids=input_ids, labels=labels)
+        
+        shift_logits = out.logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+        losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        
+        per_sequence_loss = losses.view(input_ids.size(0), -1).mean(dim=1)
+        logliks = -per_sequence_loss
+        
+        advantages_tensor = torch.tensor(advantages, dtype=logliks.dtype).to(model.device)
+        # Normalize the advantages to prevent large loss spikes
+        if advantages_tensor.std() > 1e-6: # Check to prevent division by zero
+            advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / advantages_tensor.std()
+        else:
+            advantages_tensor = torch.zeros_like(advantages_tensor)
+        
+        final_loss = (-advantages_tensor * logliks).mean()
+        
+        optimizer.zero_grad()
+        final_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        
+        torch.cuda.empty_cache()
+        step += 1
 
-            rewards = np.array(rewards)
-            baseline = np.percentile(rewards, 50)  # median baseline
-            advantages = rewards - baseline
+        # --- 6. Logging and saving (simplified) ---
+        if step % PRINT_INTERVAL == 0:
+            print(f"step {step} | loss {final_loss.item():.4f} | mean_r {np.mean(all_rewards):.3f} | baseline {np.mean(baselines):.3f}")
+            print(f"      tox={np.mean(all_tox):.3f} gen={np.mean(all_gen):.3f} style={np.mean(all_style):.3f} trivial={np.mean(all_trivial):.3f}")
 
-            # --- 3. REINFORCE loss ---
-            losses = []
-            for text, adv in zip(responses, advantages):
-                full = tok.apply_chat_template(
-                    [{"role": "user", "content": prompt},
-                     {"role": "assistant", "content": text}],
-                    tokenize=False
-                )
-                enc = tok(full, return_tensors="pt").to(model.device)
-                input_ids = enc.input_ids
-                user_len = len(tok(build_chat(tok, prompt))["input_ids"])
-                labels = input_ids.clone()
-                labels[:, :user_len] = -100
-                out = model(**enc, labels=labels)
-                loglik = -out.loss
-                print(f"Step {step}: advantage={adv.item()}, loglik={loglik.item()}")
-                losses.append(-adv * loglik)
-
-            loss = torch.stack(losses).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-
-            step += 1
-
-            # --- 4. logging ---
-            if step % PRINT_INTERVAL == 0:
-                print(f"step {step} | loss {loss.item():.4f} | mean_r {np.mean(rewards):.3f} | baseline {baseline:.3f}")
-                print(f"    tox_regex={np.mean(tox_list):.3f} gen={np.mean(gen_list):.3f} style={np.mean(style_list):.3f} trivial={np.mean(trivial_list):.3f}")
-
-            if step % SAVE_INTERVAL == 0:
-                checkpoint_dir = os.path.join(OUTDIR, "checkpoints", f"step_{step}")
-                model.save_pretrained(checkpoint_dir)
-                tok.save_pretrained(checkpoint_dir)
-                print(f"✅ Saved checkpoint at step {step} to {checkpoint_dir}")
-
-            if step >= TOTAL_STEPS:
-                break
-
-    # --- final save ---
+        if step % SAVE_INTERVAL == 0:
+            checkpoint_dir = os.path.join(OUTDIR, "checkpoints", f"step_{step}")
+            model.save_pretrained(checkpoint_dir)
+            tok.save_pretrained(checkpoint_dir)
+            print(f"✅ Saved checkpoint at step {step} to {checkpoint_dir}")
+    
     model.save_pretrained(os.path.join(OUTDIR, "policy"))
     tok.save_pretrained(os.path.join(OUTDIR, "policy"))
     print("✅ Saved fine-tuned policy.")
