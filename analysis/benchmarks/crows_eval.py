@@ -25,6 +25,7 @@ def evaluate_crows_for_model(model_name, n_samples=1000, csv_path="data/raw/crow
     # Load model
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
     model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, device_map="auto")
+    print("MODEL ID:", model.config._name_or_path) # debug
     model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)

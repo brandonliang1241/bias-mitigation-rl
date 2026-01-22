@@ -17,7 +17,7 @@ CROWS_LOCAL = "data/raw/crows_pairs.csv"
 PILOT_PROMPTS = "data/prompts/pilot_prompts.jsonl"
 
 BASELINE_MODEL = os.environ.get("BASELINE_MODEL", "Qwen/Qwen2-0.5B-Instruct")
-FINETUNED_MODEL = os.environ.get("FINETUNED_MODEL", "results/grpo_pilot/checkpoints/step_600")
+FINETUNED_MODEL = os.environ.get("FINETUNED_MODEL", "results/grpo_pilot/checkpoints/step_1000")
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(CROWS_LOCAL), exist_ok=True)
@@ -54,9 +54,9 @@ def run_detoxify():
     }
 
 def run_truthfulqa():
-    return evaluate_truthfulqa(BASELINE_MODEL, FINETUNED_MODEL, split="validation", device="cuda")
+    return evaluate_truthfulqa(BASELINE_MODEL, FINETUNED_MODEL, split="validation")
 
-# Register here
+# SPECIFY BENCHMARKS HERE
 BENCHMARKS = {
     # "crows": run_crows,
     # "detoxify": run_detoxify,
@@ -68,6 +68,9 @@ BENCHMARKS = {
 # -------------------------
 def main():
     print("Running strong evaluation benchmarks…")
+
+    print("Baseline model:", BASELINE_MODEL)
+    print("Finetuned model:", FINETUNED_MODEL)
 
     results = {}
     for name, fn in BENCHMARKS.items():
