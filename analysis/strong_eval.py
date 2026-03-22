@@ -22,7 +22,7 @@ PILOT_PROMPTS = "data/prompts/pilot_prompts.jsonl"
 N_PROMPTS_DETOX = 300
 
 BASELINE_MODEL = os.environ.get("BASELINE_MODEL", "Qwen/Qwen2-0.5B-Instruct")
-FINETUNED_MODEL = os.environ.get("FINETUNED_MODEL", "results/grpo_pilot/checkpoints/step_600")
+FINETUNED_MODEL = os.environ.get("FINETUNED_MODEL", "results/grpo_pilot/checkpoints/Trained_bias_step_1800")
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,

@@ -2,11 +2,11 @@ import os
 import json
 import pandas as pd
 from pathlib import Path
+import numpy as np
 
-# Import benchmarks
-from analysis.benchmarks.crows_eval import evaluate_crows_for_model, download_crows
-from analysis.benchmarks.detox_eval import evaluate_detoxify
-from analysis.benchmarks.truthfulqa_eval import evaluate_truthfulqa
+# python -m analysis.run_all
+
+# Import benchmarks inside the functions
 
 # -------------------------
 # Config
@@ -17,7 +17,7 @@ CROWS_LOCAL = "data/raw/crows_pairs.csv"
 PILOT_PROMPTS = "data/prompts/pilot_prompts.jsonl"
 
 BASELINE_MODEL = os.environ.get("BASELINE_MODEL", "Qwen/Qwen2-0.5B-Instruct")
-FINETUNED_MODEL = os.environ.get("FINETUNED_MODEL", "results/grpo_pilot/checkpoints/step_1000")
+FINETUNED_MODEL = os.environ.get("FINETUNED_MODEL", "results/grpo_pilot/checkpoints/step_700")
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(CROWS_LOCAL), exist_ok=True)
@@ -26,14 +26,21 @@ os.makedirs(os.path.dirname(CROWS_LOCAL), exist_ok=True)
 # Benchmark registry
 # -------------------------
 def run_crows():
+    from analysis.benchmarks.crows_eval import evaluate_crows_for_model, download_crows
     download_crows(CROWS_LOCAL, CROWS_CSV_URL)
-    frac_base, prefs_base = evaluate_crows_for_model(BASELINE_MODEL, n_samples=1000, csv_path=CROWS_LOCAL)
-    frac_tuned, prefs_tuned = evaluate_crows_for_model(FINETUNED_MODEL, n_samples=1000, csv_path=CROWS_LOCAL)
+    frac_base, prefs_base = evaluate_crows_for_model(BASELINE_MODEL, n_samples=1000, csv_path=CROWS_LOCAL, is_lora = False)
+    frac_tuned, prefs_tuned = evaluate_crows_for_model(FINETUNED_MODEL, n_samples=1000, csv_path=CROWS_LOCAL, is_lora = True)
 
     pd.DataFrame({
         "baseline_pref_stereo": prefs_base,
         "finetuned_pref_stereo": prefs_tuned
     }).to_csv(os.path.join(RESULTS_DIR, "crows_pairwise_prefs.csv"), index=False)
+    
+    prefs_base = np.array(prefs_base)
+    prefs_tuned = np.array(prefs_tuned)
+
+    print("Num flipped decisions:", np.sum(prefs_base != prefs_tuned))
+    print("Total samples:", len(prefs_base))
 
     return {
         "crows_baseline_pref_stereo": float(frac_base),
@@ -41,6 +48,7 @@ def run_crows():
     }
 
 def run_detoxify():
+    from analysis.benchmarks.detox_eval import evaluate_detoxify
     mean_base, mean_tuned, mean_diff, ci, p_val = evaluate_detoxify(
         BASELINE_MODEL, FINETUNED_MODEL, PILOT_PROMPTS, device="cuda"
     )
@@ -54,13 +62,14 @@ def run_detoxify():
     }
 
 def run_truthfulqa():
+    from analysis.benchmarks.truthfulqa_eval import evaluate_truthfulqa
     return evaluate_truthfulqa(BASELINE_MODEL, FINETUNED_MODEL, split="validation")
 
 # SPECIFY BENCHMARKS HERE
 BENCHMARKS = {
-    # "crows": run_crows,
+    "crows": run_crows,
     # "detoxify": run_detoxify,
-    "truthfulqa": run_truthfulqa,
+    # "truthfulqa": run_truthfulqa,
 }
 
 # -------------------------
