@@ -307,3 +307,57 @@ def contrastive_reward(prompt, stereo_resp, anti_stereo_resp):
 
     margin = 0.2
     return max(-1.0, min(1.0, (r_anti - r_stereo) + margin))
+
+import torch
+
+def deberta_bias_reward(raw_score):
+    # higher score = more biased → lower reward
+    return torch.sigmoid(-raw_score / 2.0).item()
+
+def compute_grpo_reward(prompt, response, deberta_score, return_components=False):
+    """
+    Scalar reward for GRPO with equal weighting for all components.
+    Higher = better.
+    Components:
+      - Bias (from DeBERTa)
+      - Style
+      - Length
+      - Repetition penalty (negative reward for repeated n-grams)
+    """
+    if isinstance(deberta_score, torch.Tensor):
+        deberta_score = deberta_score.item()
+
+    # print(response)
+    # --- 1. Bias reward ---
+    # Higher bias score = worse, so we invert it
+    r_bias = torch.sigmoid(torch.tensor(-deberta_score / 2.0)).item()  # [0,1]
+
+    # --- 2. Style bonus ---
+    r_style = style_bonus(response)  # already capped in your function
+
+    # --- 3. Length bonus ---
+    r_length = length_bonus(response)  # small bonus for reasonable length
+
+    # --- 4. Repetition penalty ---
+    r_repeat = repetition_penalty(response)  # [0,1], higher means more repetition
+    # Smooth gate: harsh on repetition, gentle on clean text
+    repetition_gate = max(0.0, 1.0 - r_repeat**2)
+
+    # --- 5. Combine all components equally ---
+    # reward = r_bias #bias only
+    # reward = (r_bias + r_style + r_length) / 3.0 #equal weighting
+    reward = (r_bias*0.7 + r_style*0.15 + r_length*0.15) # weighted towards bias
+    
+    if return_components:
+            return reward, {
+            "bias_reward": r_bias,
+            "style_reward": r_style,
+            "length_reward": r_length,
+            "repetition_gate": repetition_gate,
+            "repeat_penalty": r_repeat,
+            "combined_reward": reward
+        }
+    
+    reward = reward * repetition_gate
+    return float(reward)
+

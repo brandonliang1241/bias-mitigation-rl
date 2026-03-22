@@ -1,15 +1,16 @@
 import os, sys, random, json
 import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup, LogitsProcessor, LogitsProcessorList, pipeline 
-from torch import amp
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, get_linear_schedule_with_warmup, LogitsProcessor, LogitsProcessorList, pipeline, BitsAndBytesConfig
+from torch import amp, nn
+from safetensors.torch import load_file
+from peft import LoraConfig, get_peft_model
 
 torch.cuda.empty_cache()
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from reward.bias_reward import compute_bias_reward, toxicity_score_regex, group_generalization_score, style_bonus, trivial_penalty, classifier_toxicity
+from reward.bias_reward import compute_bias_reward, toxicity_score_regex, group_generalization_score, style_bonus, trivial_penalty, compute_grpo_reward
 
-from transformers import BitsAndBytesConfig, AutoModelForCausalLM
 # Define the quantization configuration
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -22,11 +23,12 @@ PROMPTS = "data/prompts/new_prompts.jsonl"
 # PROMPTS = "data/prompts/pilot_prompts.jsonl"
 OUTDIR = "results/grpo_pilot"
 
-TOTAL_STEPS = 1000
-PRINT_INTERVAL = 1
-SAVE_INTERVAL = 100 # Save a checkpoint every 50 steps
+TOTAL_STEPS = 2000
+PRINT_INTERVAL = 5
+SAVE_INTERVAL = 100 # Save a checkpoint every 100 steps
+DEBUG_INTERVAL = 50 # Print and check model output and reward scores
 K = 4
-MAX_NEW_TOKENS = 128
+MAX_NEW_TOKENS = 64 # Low to speed up training
 FAST_MODE = False # skip LM toxicity for speed
 
 
@@ -66,7 +68,7 @@ def clean_response(text):
     return "".join(c for c in text if c.isprintable())
 
 # --- sample multiple responses safely ---
-def sample_responses_debug(model, tok, prompts, K, max_new_tokens=MAX_NEW_TOKENS, temperature=0.7, top_p=0.7):
+def sample_responses_debug(model, tok, prompts, K, max_new_tokens=MAX_NEW_TOKENS, temperature=0.8, top_p=0.85):
     """
     Debug version: generates K responses per prompt, one at a time, with detailed logging.
     Safe for Qwen2 with gradient checkpointing.
@@ -110,57 +112,85 @@ def sample_responses_debug(model, tok, prompts, K, max_new_tokens=MAX_NEW_TOKENS
 
     return all_responses_data
 
-def sample_responses_debug_fast(model, tok, prompts, K, max_new_tokens=MAX_NEW_TOKENS,
-                                temperature=0.7, top_p=0.7):
-    """
-    Faster debug version of sample_responses_debug:
-    - Generates K responses per prompt in a single batch
-    - Uses mixed precision for speed
-    - Safe for Qwen2 (gradient checkpointing can remain enabled)
-    """
+
+def strip_assistant_prefix(text: str) -> str:
+    text = text.lstrip()
+    for prefix in ["assistant", "Assistant", "?assistant", ".assistant"]:
+        if text.startswith(prefix):
+            return text[len(prefix):].lstrip()
+    return text
+
+
+def sample_responses_debug_fast(
+    model,
+    tok,
+    prompt_encodings,
+    K,
+    max_new_tokens=MAX_NEW_TOKENS,
+    temperature=0.7,
+    top_p=0.7,
+):
+
     all_responses_data = []
 
-    for i, prompt in enumerate(prompts):
-        text = build_chat(tok, prompt)
-        input_ids = tok(text, return_tensors="pt").input_ids.to(model.device)
+    input_ids = prompt_encodings["input_ids"]
+    attention_mask = prompt_encodings["attention_mask"]
 
-        # Repeat input_ids K times for batched generation
-        input_ids_batch = input_ids.repeat(K, 1)
+    B = input_ids.shape[0]
 
-        # Use autocast for mixed precision to speed up
-        with torch.autocast("cuda"):
-            try:
-                outputs = model.generate(
-                    input_ids=input_ids_batch,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=top_p,
-                    use_cache=False  # needed if gradient checkpointing is enabled
-                )
-            except Exception as e:
-                print(f"❌ Generation failed for prompt {i}: {e}")
-                outputs = [input_ids[0]] * K  # fallback empty responses
+    # Repeat prompts K times
+    input_ids_batch = input_ids.repeat_interleave(K, dim=0)
+    attention_mask_batch = attention_mask.repeat_interleave(K, dim=0)
 
-        # Decode outputs
-        prompt_responses = []
-        for o in outputs:
-            resp = tok.decode(o, skip_special_tokens=True)
-            resp_clean = clean_response(resp)
-            prompt_responses.append(resp_clean)
+    prompt_lengths = attention_mask_batch.sum(dim=1)
+
+    with torch.autocast("cuda"):
+        outputs = model.generate(
+            input_ids=input_ids_batch,
+            attention_mask=attention_mask_batch,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            use_cache=False,
+        )
+
+    # slice generated tokens only
+    generated_tokens = []
+    for i in range(outputs.size(0)):
+        gen = outputs[i, prompt_lengths[i]:]
+        generated_tokens.append(gen)
+
+    # Decode responses
+    decoded_responses = tok.batch_decode(
+        generated_tokens,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+
+    # Repack per-prompt
+    idx = 0
+    for i in range(B):
+        responses = []
+        for _ in range(K):
+            resp = clean_response(decoded_responses[idx])
+            resp = strip_assistant_prefix(resp)
+            responses.append(resp)
+            idx += 1
+
+        prompt_text = tok.decode(
+            input_ids[i],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )
 
         all_responses_data.append({
-            "prompt": prompt,
-            "responses": prompt_responses
+            "prompt": prompt_text,
+            "responses": responses
         })
 
-        # Debug prints for first few prompts
-        # print(f"\n=== DEBUG PROMPT {i} ===")
-        # print("Prompt:", prompt)
-        # for k, resp in enumerate(prompt_responses):
-            # print(f"Sample {k+1}/{K}: {resp[:200]}")  # only show first 200 chars
-
     return all_responses_data
+
 
 # --- compute reward components ---
 def reward_components(prompt, response, tox_model_score, fast_mode=False):
@@ -176,40 +206,236 @@ def reward_components(prompt, response, tox_model_score, fast_mode=False):
     return reward, tox_regex, gen, style, trivial
 
 
+# reward/deberta_reward.py
+MODEL_DIR = "DeBERTaV3/ToxiGen/deberta_bias_scorer"
+MAX_LEN = 128
+
+class DebertaPairwiseReward(nn.Module):
+    def __init__(self, model_name):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(model_name)
+        self.scorer = nn.Linear(self.encoder.config.hidden_size, 2)  # <-- change from 1 to 2
+
+    def forward(self, input_ids, attention_mask):
+        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        cls = out.last_hidden_state[:, 0]
+        return self.scorer(cls)  # shape [B,2]
+
+
+def load_deberta_reward(device):
+    """
+    Load the DeBERTa pairwise reward model from checkpoint (.safetensors or .bin).
+    Returns frozen model and tokenizer.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model = DebertaPairwiseReward("microsoft/deberta-v3-small")
+
+    # Load checkpoint
+    checkpoint_path_bin = f"{MODEL_DIR}/pytorch_model.bin"
+    checkpoint_path_safetensors = f"{MODEL_DIR}/model.safetensors"
+
+    if torch.cuda.is_available():
+        map_location = device
+    else:
+        map_location = 'cpu'
+
+    try:
+        # Try safetensors first
+        state = load_file(checkpoint_path_safetensors, device=map_location)
+        model.load_state_dict(state)
+    except Exception as e:
+        print(f"❌ Failed to load safetensors: {e}, trying .bin")
+        state = torch.load(checkpoint_path_bin, map_location=map_location)
+        model.load_state_dict(state)
+
+    model.to(device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+
+    return model, tokenizer
+
+
+def deberta_score_batch(model, tokenizer, texts, device, max_len=MAX_LEN):
+    enc = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        logits = model(enc["input_ids"], enc["attention_mask"])  # [B,2]
+
+    # Convert pairwise logits → scalar bias score
+    bias_score = logits[:, 1] - logits[:, 0]   # [B]
+
+    return bias_score.cpu()
+
+
+def debug_step(step, flat_prompts, flat_responses, advantages, deberta_model, deberta_tokenizer, device):
+    """
+    Debug printing for GRPO training, ensures each response matches its prompt.
+    
+    Prints the prompt, response, computed GRPO reward, and advantage.
+    """
+    print(f"\n🛠️  DEBUG STEP {step} 🛠️")
+
+    # Compute DeBERTa bias scores for all responses
+    deberta_scores = deberta_score_batch(deberta_model, deberta_tokenizer, flat_responses, device=device)
+
+    for i, (prompt, resp, adv, bias_score) in enumerate(zip(flat_prompts, flat_responses, advantages, deberta_scores)):
+        reward = compute_grpo_reward(prompt, resp, bias_score)  # Use actual GRPO scalar reward
+        print(f"\nPrompt [{i}]: {prompt[:300]}...")  # truncate long prompts
+        print(f"  ✅ Response: {resp[:300]}... | Reward: {reward:.4f} | Advantage: {adv.item():.4f}")
+
+    # Batch-level stats
+    all_rewards = [compute_grpo_reward(p, r, s) for p, r, s in zip(flat_prompts, flat_responses, deberta_scores)]
+    batch_mean_reward = np.mean(all_rewards)
+    batch_adv_std = advantages.std().item()
+    print(f"\nBatch Mean Reward: {batch_mean_reward:.4f} | Advantage Std: {batch_adv_std:.4f}\n")
+
+    return batch_mean_reward, batch_adv_std
+
+# --- plotting code ---
+import matplotlib.pyplot as plt
+
+# Store metrics for plotting
+training_log = {
+    "steps": [],
+    "mean_reward": [],
+    "adv_std": []
+}
+
+def log_training_metrics(step, mean_reward, adv_std):
+    training_log["steps"].append(step)
+    training_log["mean_reward"].append(mean_reward)
+    training_log["adv_std"].append(adv_std)
+
+
+def plot_training_metrics():
+    plt.figure(figsize=(10,5))
+    
+    # Mean reward
+    plt.plot(training_log["steps"], training_log["mean_reward"], label="Mean Reward", marker='o')
+    
+    # Advantage std
+    plt.plot(training_log["steps"], training_log["adv_std"], label="Advantage Std", marker='x')
+    
+    plt.xlabel("Training Step")
+    plt.ylabel("Value")
+    plt.title("GRPO Training Metrics")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+import textstat
+import json
+LOG_FILE = os.path.join(OUTDIR, "training_log.jsonl")
+
+def log_metrics(step, prompt, response, components, kl_value=None, deberta_score=None):
+    log = {
+        "step": step,
+        "prompt": prompt,
+        "response": response,
+        "bias_reward": components["bias_reward"],
+        "style_reward": components["style_reward"],
+        "length_reward": components["length_reward"],
+        "repeat_penalty": components["repeat_penalty"],
+        "repetition_gate": components["repetition_gate"],
+        "combined_reward": components["combined_reward"],
+        "kl": kl_value,
+        "mean_deberta_score": deberta_score,
+        "response_length": len(response.split()),
+        "readability": textstat.flesch_reading_ease(response)
+    }
+
+    # Append to file
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(log) + "\n")
+# -------------------------
+
 # --- main training loop ---
 def main():
     os.makedirs(OUTDIR, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # Load DeBERTa once, frozen
+    deberta_model, deberta_tokenizer = load_deberta_reward(device)
+
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True, padding_side="left")
-    model = AutoModelForCausalLM.from_pretrained(MODEL, trust_remote_code=True, quantization_config=bnb_config).to(device)
-    # # --- The Corrected Fix ---
-    # # 1. Set the padding side for the tokenizer.
-    # # For decoder-only models like Qwen2, left-padding is essential for correct batch generation.
-    # tok.padding_side = "left"
-    
-    # # 2. Add a new pad token if the tokenizer doesn't have one.
-    # # Many instruction-tuned models don't have a default pad token.
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, 
+        trust_remote_code=True, 
+        quantization_config=bnb_config
+    ).to(device)
+
+    # =====================
+    # Apply LoRA to policy model
+    # =====================
+
+    # Freeze base model weights
+    for p in model.parameters():
+        p.requires_grad = False
+
+    lora_config = LoraConfig(
+        r=16,                    # good starting point
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],  # correct for Qwen2
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    # Optional but VERY useful
+    model.print_trainable_parameters()
+
+    # ref model for comparison 
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        MODEL,
+        trust_remote_code=True,
+        quantization_config=bnb_config
+    ).to(device)
+
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad = False
+
+    # Ensure pad token is set properly
+    tok.padding_side = "left"
     if tok.pad_token is None:
-        tok.add_special_tokens({'pad_token': '<|pad|>'})
-
-    # # 3. Resize the model's token embeddings to accommodate the new token.
+        tok.add_special_tokens({'pad_token': tok.eos_token})
+    tok.pad_token = tok.eos_token
     model.resize_token_embeddings(len(tok))
-
-    # # 4. CRITICAL: Update the model's configuration to use the new pad token ID.
-    # # This is the step that resolves the CUDA error.
+    ref_model.resize_token_embeddings(len(tok))
     model.config.pad_token_id = tok.pad_token_id
-    
-    print("Initializing toxicity classifier...")
-    tox_pipeline = pipeline("text-classification", model="unitary/toxic-bert", device=-1, truncation=True)
-    print("Initialization complete.")
+    ref_model.config.pad_token_id = tok.pad_token_id
 
     model.train()
+    # --- Load and pretokenize prompts ---
+    prompts_data = load_prompts(PROMPTS, n=300)
+    prompt_texts = [build_chat(tok, ex["prompt"]) for ex in prompts_data]
+
+    # Tokenize ALL prompts ONCE and move to GPU
+    prompt_encodings = tok(
+        prompt_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512  # optional
+    ).to(model.device)
 
     prompts = load_prompts(PROMPTS, n=300)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6, betas=(0.9, 0.999), eps=1e-6)
-    scheduler = get_linear_schedule_with_warmup(optimizer, 50, TOTAL_STEPS)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=5e-5,   # LoRA needs MUCH higher LR
+        betas=(0.9, 0.999),
+        eps=1e-6
+    )
 
     # DEBUG
     # for p in prompts[:1]:
@@ -219,55 +445,75 @@ def main():
     #     print(tok.decode(output[0], skip_special_tokens=True))
 
     step = 0
-    batch_size = 2  # Increase batch size to fully leverage the GPU
-    running_baseline = 0.05   # small, fixed start
-    baseline_beta = 0.995    # VERY slow
-    
-    model.gradient_checkpointing_enable()
+    batch_size = 4  # Increase batch size to fully leverage the GPU
+
     model.config.use_cache = False
+    import time
 
     while step < TOTAL_STEPS:
-        batch_prompts_data = random.sample(prompts, batch_size)
-        batch_prompts = [ ex["prompt"] for ex in batch_prompts_data]
+        t0 = time.time()
+        # 1️⃣ Sample batch indices instead of Python objects
+        batch_indices = np.random.choice(len(prompts), batch_size, replace=False)
+        batch_encodings = {
+            "input_ids": prompt_encodings.input_ids[batch_indices],
+            "attention_mask": prompt_encodings.attention_mask[batch_indices]
+        }
 
-        # --- 1. Batch generate responses for the entire batch ---
-        all_responses_data = sample_responses_debug_fast(model, tok, batch_prompts, K, MAX_NEW_TOKENS)
-        
-        # --- 2. Flatten all prompts and responses to prepare for reward calculation ---
+        # --- 2️⃣ Batch generate responses using optimized function ---
+        all_responses_data = sample_responses_debug_fast(model, tok, batch_encodings, K, MAX_NEW_TOKENS)
+
+        # --- 3️⃣ Flatten all prompts and responses for reward calculation ---
         flat_prompts = []
         flat_responses = []
+        
         for ex_data in all_responses_data:
-            flat_prompts.extend([ex_data["prompt"]] * len(ex_data["responses"]))
-            flat_responses.extend([r.strip() for r in ex_data["responses"]])
+            prompt_text = ex_data["prompt"].strip()
+            for r in ex_data["responses"]:
+                flat_prompts.append(prompt_text)
+                flat_responses.append(r)   # ← THIS is the missing line
 
+        t1 = time.time()
             
         # --- 3. Batch compute rewards ---
-        tox_model_scores = classifier_toxicity(flat_responses, tox_pipeline=tox_pipeline)
+        # --- 3.1: Batch DeBERTa scores for all responses ---
+        deberta_scores = deberta_score_batch(
+            deberta_model,
+            deberta_tokenizer,
+            flat_responses,
+            device=device,
+            max_len=MAX_LEN
+        )
+        # ---------- DEBUGGING -----------
+        # responses_per_prompt = [
+        #     ex_data["responses"]
+        #     for ex_data in all_responses_data
+        # ]  # shape: [B][K]
+        # rep_responses = [
+        #     clean_response(responses[0])
+        #     for responses in responses_per_prompt
+        # ]
+        # print("DEBUG DeBERTa inputs:", len(rep_responses))
+        # rep_deberta_scores = deberta_score_batch(
+        #     deberta_model,
+        #     deberta_tokenizer,
+        #     rep_responses,
+        #     device=device,
+        #     max_len=MAX_LEN
+        # )  # shape: [B]
+        # # Repeat each prompt's score K times
+        # deberta_scores = torch.repeat_interleave(
+        #     rep_deberta_scores,
+        #     repeats=K
+        # )
+        # ----------------------
         
-        # You can't easily batch the other reward functions unless you modify them
-        # to accept lists. For now, we'll keep this loop but acknowledge it's a bottleneck.
-        # ✅ Pass the pipeline as an argument
-        
-        all_rewards = []
-        all_tox, all_gen, all_style, all_trivial = [], [], [], []
-        
-        for i, r in enumerate(flat_responses):
-            # clean_r = flat_responses[i].replace("<|im_start|>", "").replace("<|im_end|>", "").strip()
-            clean_r = clean_response(flat_responses[i])
-            # DEBUG
-            if i == 1:
-                print("DEBUG | raw response:", clean_r)
-            reward, tox, gen, style, trivial = reward_components(flat_prompts[i], clean_r, tox_model_scores[i], fast_mode=FAST_MODE)
-            
-            if step < 500:
-                trivial *= 0.5
+        t2 = time.time()
+        # --- 3.2: Compute final rewards ---
+        all_rewards = [
+            compute_grpo_reward(p, r, s)
+            for p, r, s in zip(flat_prompts, flat_responses, deberta_scores)
+        ]
 
-            all_rewards.append(reward)
-            all_tox.append(tox)
-            all_gen.append(gen)
-            all_style.append(style)
-            all_trivial.append(trivial)
-        
         #debug
         if step < 20:
             print("DEBUG rewards:", all_rewards[:8])
@@ -275,130 +521,207 @@ def main():
         # --- 4. Compute advantages and create a single batched loss input ---
         reshaped_rewards = np.array(all_rewards).reshape(batch_size, K)
         
-        # Contrastive Bias
-        tox_matrix = np.array(all_tox).reshape(batch_size, K)
-        best_tox = tox_matrix.min(axis=1, keepdims=True)
-        contrastive_bias = tox_matrix - best_tox
-        lambda_cb = 0.5
-        reshaped_rewards -= lambda_cb * contrastive_bias
+        # Convert to torch tensor on GPU
+        rewards = torch.tensor(reshaped_rewards, device=model.device, dtype=torch.float32)
 
-        #Debug
-        if step < 5:
-            print("DEBUG tox:", all_tox[:8])
+        with torch.no_grad():
+            reward_std_per_prompt = rewards.std(dim=1).mean().item()
+            reward_range = (rewards.max() - rewards.min()).item()
+        print(
+            f"reward_std/prompt {reward_std_per_prompt:.4f} | "
+            f"reward_range {reward_range:.3f}"
+        )
 
-        # Advantage computation
-        advantages = np.zeros_like(reshaped_rewards)
-        for i in range(batch_size):
-            ranks = reshaped_rewards[i].argsort().argsort()
-            advantages[i] = ranks - ranks.mean()
+        group_mean = rewards.mean(dim=1, keepdim=True)
+        advantages = rewards - group_mean
+        group_std = rewards.std(dim=1, keepdim=True).clamp(min=1e-8)
+        advantages = advantages / group_std
 
-        advantages = advantages.flatten()
-        advantages = advantages / (advantages.std() + 1e-8)
+        advantages = advantages.view(-1)                  # [B*K]
+        print("adv per prompt:\n", advantages.view(batch_size, K))
+        print(f"adv_mean {advantages.mean().item():.3f} | adv_std {advantages.std().item():.3f}")
 
         # --- 5. Batch the REINFORCE loss calculation and optimizer step ---
-        all_full_texts = [
-            tok.apply_chat_template([
-                {"role": "user", "content": flat_prompts[i]},
-                {"role": "assistant", "content": flat_responses[i]}
-            ], tokenize=False)
-            for i in range(len(flat_prompts))
-        ]
-        
-        enc = tok(all_full_texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
-        input_ids = enc.input_ids
-        
-        # with amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        #     out = model(input_ids=input_ids)
-        out = model(input_ids=input_ids)
-            
-        logits = out.logits  # [B*K, T, V]
+        # ----------------------------
+        # Vectorized tokenization (GPU-friendly)
+        # ----------------------------
+        MAX_SEQ_LEN = min(512, model.config.max_position_embeddings)
+        assistant_max_len = MAX_NEW_TOKENS
 
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        # 1. Tokenize user prompts in batch
+        prompt_enc = {
+            "input_ids": batch_encodings["input_ids"].repeat_interleave(K, dim=0),
+            "attention_mask": batch_encodings["attention_mask"].repeat_interleave(K, dim=0),
+        }
+        prompt_lengths = prompt_enc["attention_mask"].sum(dim=1)
 
-        # Shift for causal LM
+        # 2. Tokenize assistant responses in batch
+        response_enc = tok(
+            flat_responses,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=assistant_max_len,
+            padding="max_length",  # <-- pad responses to max length in batch
+            return_tensors="pt"
+        ).to(model.device)
+
+        # 3. Combine prompt + response, truncate to MAX_SEQ_LEN
+        combined_input_ids = torch.cat([prompt_enc["input_ids"], response_enc["input_ids"]], dim=1)
+        combined_input_ids = combined_input_ids[:, :MAX_SEQ_LEN]
+
+        prompt_lengths = torch.clamp(prompt_lengths, max=combined_input_ids.size(1)-1)
+
+        # 4. Attention mask
+        attention_mask = (combined_input_ids != tok.pad_token_id).long()
+
+        # ----------------------------
+        # --- 6. Forward + REINFORCE ---
+        # ----------------------------
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            out = model(input_ids=combined_input_ids, attention_mask=attention_mask)
+            logits = out.logits
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        
+        with torch.no_grad():
+            ref_out = ref_model(
+                input_ids=combined_input_ids,
+                attention_mask=attention_mask
+            )
+            ref_log_probs = torch.log_softmax(ref_out.logits, dim=-1)
+
+        # shift for causal LM
         shift_log_probs = log_probs[:, :-1, :]
-        shift_input_ids = input_ids[:, 1:]
+        shift_ref_log_probs = ref_log_probs[:, :-1, :]
+        shift_input_ids = combined_input_ids[:, 1:]
+        shift_attention_mask = attention_mask[:, 1:]
 
-        # Mask prompt tokens
-        prompt_texts = [
-            build_chat(tok, p) for p in flat_prompts
-        ]
-        prompt_enc = tok(prompt_texts, return_tensors="pt", padding=True)
-        prompt_lens = prompt_enc.attention_mask.sum(dim=1)
+        # generated token mask
+        gen_mask = torch.zeros_like(shift_attention_mask)
+        for i, plen in enumerate(prompt_lengths):
+            if plen < combined_input_ids.size(1):
+                gen_mask[i, plen:] = 1  # start right after prompt
+        gen_mask = gen_mask * shift_attention_mask  # mask out padding
+        # print("gen_mask first row:", gen_mask[0].cpu().numpy())
+        # print("prompt_length:", prompt_lengths[0])
+        # print(f"combined_input_ids: {combined_input_ids.shape}, shift_input_ids: {shift_input_ids.shape}, gen_mask: {gen_mask.shape}"
 
-        attention_mask = torch.ones_like(shift_input_ids)
-        for i in range(len(flat_prompts)):
-            attention_mask[i, :prompt_lens[i]-1] = 0
-
-        # Gather log-probs of generated tokens
+        # gather log-probs of generated tokens
         token_log_probs = shift_log_probs.gather(
             dim=-1,
             index=shift_input_ids.unsqueeze(-1)
         ).squeeze(-1)
 
-        # Apply mask
-        token_log_probs = token_log_probs * attention_mask
+        # mask prompt tokens
+        # token_log_probs = token_log_probs * gen_mask 
+        
+        # token-wise KL on sampled actions
+        # 1. compute token-wise KL over vocab
+        kl_tokens = shift_log_probs.exp() * (shift_log_probs - shift_ref_log_probs)  # [B, T, V]
+        kl_per_token = kl_tokens.sum(dim=-1)  # [B, T]
 
-        # Sequence log-prob 
-        logliks = token_log_probs.sum(dim=1)
-        
-        advantages_tensor = torch.tensor(
-            advantages,
-            dtype=logliks.dtype,
-            device=model.device
-        ).detach()
-        
+        # 2. mask prompt tokens
+        kl_masked = kl_per_token * gen_mask  # [B, T]
+
+        # 3. average
+        kl = kl_masked.sum() / gen_mask.sum().clamp(min=1)
+        print(f"KL {kl.item():.4f}")
+        if kl.item() > 0.3: # hard skip if kl exceeds
+            print("⚠️ KL too large, skipping optimizer step")
+            optimizer.zero_grad()
+            del combined_input_ids, attention_mask, log_probs, logits
+            del shift_log_probs, shift_input_ids, shift_attention_mask, token_log_probs
+            torch.cuda.empty_cache()
+            continue
+
+        # sequence log-likelihoods
+        token_counts = gen_mask.sum(dim=1).clamp(min=1)
+        logliks = (token_log_probs * gen_mask).sum(dim=1) / token_counts
+
+        # REINFORCE loss
+        advantages_tensor = advantages.detach().clamp(-1.0, 1.0) #added clamp
         policy_loss = (-advantages_tensor * logliks).mean()
 
-        # ================================
-        # ✅ ENTROPY BONUS (ADD HERE)
-        # ================================
-        # entropy: [B*K, T]
-        entropy = -(log_probs.exp() * log_probs).sum(dim=-1)  # [B*K, T]
+        # entropy bonus
+        entropy = -(shift_log_probs.exp() * shift_log_probs).sum(dim=-1)
+        entropy = (entropy * gen_mask).sum() / gen_mask.sum().clamp(min=1)
 
-        entropy_seq_len = entropy.shape[1]
-        mask_seq_len = attention_mask.shape[1]
+        entropy_coef = 0.005
 
-        if entropy_seq_len != mask_seq_len:
-            # Truncate or pad the mask
-            if mask_seq_len > entropy_seq_len:
-                attention_mask = attention_mask[:, :entropy_seq_len]
-            else:
-                pad = torch.ones((attention_mask.shape[0], entropy_seq_len - mask_seq_len), device=attention_mask.device)
-                attention_mask = torch.cat([attention_mask, pad], dim=1)
+        # kl controller
+        TARGET_KL = 0.1
+        if kl.item() > TARGET_KL * 2:
+            kl_coef = 0.2
+        elif kl.item() > TARGET_KL:
+            kl_coef = 0.1
+        else:
+            kl_coef = 0.02
 
-        entropy = entropy * attention_mask
-        entropy = entropy.sum() / attention_mask.sum().clamp(min=1)
+        final_loss = policy_loss - entropy_coef * entropy + kl_coef * kl
 
-        # print(f"entropy {entropy.item():.3f}")
-
-        entropy_coef = 0.01  # start small
-        final_loss = policy_loss - entropy_coef * entropy
-
-        # final_loss = (-advantages_tensor * logliks).mean()
-        
+        # backward + step
         optimizer.zero_grad()
         final_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        # scheduler.step()
-        
+
+        t3 = time.time()
         step += 1
 
         # --- 6. Logging and saving (simplified) ---
+        # Assume flat_prompts, flat_responses, deberta_scores are ready
+        for prompt, response, bias_score in zip(flat_prompts, flat_responses, deberta_scores):
+            combined_reward, components = compute_grpo_reward(prompt, response, bias_score, return_components=True)
+
+            # Optionally, KL per batch (use per sample if you have)
+            kl_value = kl.item()  # or per-response if you compute it individually
+
+            log_metrics(
+                step=step,
+                prompt=prompt,
+                response=response,
+                components=components,
+                kl_value=kl_value,
+                deberta_score=bias_score.item() if isinstance(bias_score, torch.Tensor) else bias_score
+            )
+        
         if step % PRINT_INTERVAL == 0:
-            print(f"step {step} | loss {final_loss.item():.4f} | mean_r {np.mean(all_rewards):.3f} | baseline {np.mean(running_baseline):.3f}")
-            print(f"      tox={np.mean(all_tox):.3f} gen={np.mean(all_gen):.3f} style={np.mean(all_style):.3f} trivial={np.mean(all_trivial):.3f} entropy {entropy.item():.3f}")
+            print(f"step {step} | loss {final_loss.item():.4f} | mean_r {np.mean(all_rewards):.3f} | mean_r_scaled {rewards.mean().item():.3f}")
+            print(f"entropy {entropy.item():.3f}")
 
         if step % SAVE_INTERVAL == 0:
             checkpoint_dir = os.path.join(OUTDIR, "checkpoints", f"step_{step}")
             model.save_pretrained(checkpoint_dir)
             tok.save_pretrained(checkpoint_dir)
             print(f"✅ Saved checkpoint at step {step} to {checkpoint_dir}")
+        
+        if step % DEBUG_INTERVAL == 0 or step == 1:
+            # Call debug function
+            batch_mean_r, batch_adv_std = debug_step(
+                step,
+                flat_prompts=flat_prompts,       # flattened, matches flat_responses
+                flat_responses=flat_responses,
+                advantages=advantages.detach(),
+                deberta_model=deberta_model,
+                deberta_tokenizer=deberta_tokenizer,
+                device=device
+            )
 
-        del enc, input_ids, logits, log_probs
-        del token_log_probs, logliks, advantages_tensor, final_loss
+            # Optionally track metrics for plotting
+            log_training_metrics(step, batch_mean_r, batch_adv_std)
+        
+        del combined_input_ids, attention_mask, log_probs, logits
+        del shift_log_probs, shift_input_ids, shift_attention_mask, token_log_probs, logliks, advantages_tensor, final_loss
         torch.cuda.empty_cache()
+
+        t4 = time.time()
+        print(f"""
+        Timing:
+        generation: {t1 - t0:.2f}s
+        reward:     {t2 - t1:.2f}s
+        backward:   {t3 - t2:.2f}s
+        print & delete:   {t4 - t3:.2f}s
+        """)
     
     model.save_pretrained(os.path.join(OUTDIR, "policy"))
     tok.save_pretrained(os.path.join(OUTDIR, "policy"))
