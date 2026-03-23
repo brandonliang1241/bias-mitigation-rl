@@ -36,6 +36,7 @@ Implemented in `src/reward/bias_reward.py`, combining:
 
 ---
 
+```
 ## 📂 Repository Structure
 bias-mitigation-rl/
 │── DeBERTaV3/ToxiGen/ # Pretrained bias scoring model
@@ -58,3 +59,4 @@ bias-mitigation-rl/
 │ │ └── grpo_train.py
 │
 │── .gitignore
+```
